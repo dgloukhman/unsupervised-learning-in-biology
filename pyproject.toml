@@ -4,4 +4,17 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "bio>=1.8.1",
+    "fair-esm",
+    "ipykernel>=7.1.0",
+    "matplotlib>=3.10.7",
+    "pandas>=2.3.3",
+    "scikit-learn>=1.7.2",
+    "torch>=2.9.1",
+    "torchaudio>=2.9.1",
+    "torchvision>=0.24.1",
+]
+
+[tool.uv.sources]
+fair-esm = { git = "https://github.com/facebookresearch/esm.git" }
