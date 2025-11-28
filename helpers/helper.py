@@ -17,48 +17,83 @@ def randomize_model(model):
             torch.nn.init.constant_(param, 0)
     return uninit_model
 
-def get_hidden_representations(model, alphabet, labels, sequences):
+
+def get_hidden_representations(model, alphabet, labels, sequences, batch_size=1):
     """
-    Verarbeitet Sequenzen durch das ESM-Modell und gibt die Hidden States (Token-Repräsentationen) zurück.
+    Verarbeitet Sequenzen in Batches durch das ESM-Modell.
     
     Args:
         model: Das geladene ESM Modell.
         alphabet: Das zum Modell gehörige Alphabet-Objekt.
         labels: Liste von Strings (Namen der Proteine).
         sequences: Liste von Strings (Aminosäuresequenzen).
+        batch_size: Anzahl der Sequenzen pro Durchlauf (Integer).
         
     Returns:
-        tuple: (token_representations [Tensor], batch_strs [List])
+        tuple: (all_token_representations [List of Tensors], all_strs [List])
     """
-    # 1. Batch Converter vorbereiten
+    # 1. Gerät bestimmen und Batch Converter vorbereiten
+    device = next(model.parameters()).device
     batch_converter = alphabet.get_batch_converter()
+    
+    # Daten zippen
     data = list(zip(labels, sequences))
     
-    # 2. Sequenzen in Token umwandeln
-    batch_labels, batch_strs, batch_tokens = batch_converter(data)
+    all_token_representations = []
+    all_strs = []
     
-    # 3. Auf das richtige Gerät schieben
-    device = next(model.parameters()).device
-    batch_tokens = batch_tokens.to(device)
-
-    # 4. Letzten Layer identifizieren
+    # 2. Layer identifizieren (Output Layer)
     repr_layer = model.num_layers
+    
+    print(f"Processing {len(data)} sequences in batches of {batch_size}...")
 
-    # 5. Inferenz
-    with torch.no_grad():
-        results = model(batch_tokens, repr_layers=[repr_layer], return_contacts=False)
-    
-    token_representations = results["representations"][repr_layer]
-    
-    return token_representations, batch_strs
+    # 3. Schleife über die Daten in Chunks (Batches)
+    for i in range(0, len(data), batch_size):
+        # Slice current batch
+        batch_data = data[i : i + batch_size]
+        
+        # Labels, Strings und Tokens für diesen Batch erzeugen
+        batch_labels, batch_strs, batch_tokens = batch_converter(batch_data)
+        batch_tokens = batch_tokens.to(device)
+        
+        # 4. Inferenz (Memory Management ist hier wichtig)
+        with torch.no_grad():
+            results = model(batch_tokens, repr_layers=[repr_layer], return_contacts=False)
+        
+        # Ergebnis extrahieren (Shape: [Batch_Size, Max_Seq_Len_in_Batch, Hidden_Dim])
+        token_representations = results["representations"][repr_layer]
+        
+        # 5. Ergebnisse speichern und Speicher freigeben
+        # WICHTIG: Wir müssen die Tensoren vom GPU-Speicher (CUDA) auf die CPU schieben,
+        # sonst läuft der GPU-Speicher voll.
+        for j, tokens in enumerate(batch_tokens):
+            # Wir entfernen das Padding für jede Sequenz individuell.
+            # ESM nutzt Padding Token (oft Index 1). Wir zählen nur echte Token.
+            # (Alternativ: Wir nehmen die Länge von batch_strs[j] + 2 für CLS/EOS tokens)
+            seq_len = len(batch_strs[j]) + 2 # +2 für <cls> und <eos>
+            
+            # Slice: Nur die echten Daten, kein Padding
+            # .cpu() bewegt die Daten in den RAM
+            seq_rep = token_representations[j, :seq_len].cpu()
+            
+            all_token_representations.append(seq_rep)
+            
+        all_strs.extend(batch_strs)
+        
+        # Optional: Cache leeren, falls GPU sehr klein ist
+        torch.cuda.empty_cache()
+
+    return all_token_representations, all_strs
+
 
 def get_protein_embedding(token_representations, batch_strs):
     """
-    Führt Mean Pooling auf den Hidden Representations durch, um ein Embedding pro Protein zu erhalten.
+    Führt Mean Pooling auf den Hidden Representations durch, um ein Embedding pro Protein zu erhalten. 
+    TODO: Mean pooling: exclude special tokens & padding.
     
     Args:
-        token_representations (Tensor): Output von get_hidden_representations.
-        batch_strs (List): Liste der Sequenzen (benötigt für die Länge ohne Padding).
+        token_representations (List[Tensor]): Output von get_hidden_representations (Liste von Tensoren).
+        batch_strs (List[str]): Liste der Sequenzen.
         
     Returns:
         numpy.ndarray: Array der Embeddings (Shape: [N, hidden_dim]).
@@ -69,43 +104,17 @@ def get_protein_embedding(token_representations, batch_strs):
     for i, seq_str in enumerate(batch_strs):
         seq_len = len(seq_str)
         
-        # Slice [1 : len+1] entfernt Start-Token (CLS) und Padding am Ende.
-        # .mean(0) mittelt über die Sequenzlänge (Dimension 0 des Slices).
-        # [cite_start]Das entspricht: "averaging across the hidden representation at each position" [cite: 154]
-        seq_embedding = token_representations[i, 1 : seq_len + 1].mean(0)
+        # FIX: Zugriff auf Liste zuerst mit [i], dann Slicing des Tensors mit [1 : ...]
+        # Wir nehmen Index 1 bis seq_len + 1, um Start-Token (<cls>) und End-Token (<eos>) zu ignorieren.
+        # Dies entspricht dem "averaging across the hidden representation at each position".
+        
+        # token_representations[i] ist der Tensor für das i-te Protein.
+        seq_tensor = token_representations[i]
+        
+        # Slicing: [1 : seq_len + 1] extrahiert nur die Aminosäuren.
+        # .mean(0) berechnet den Durchschnitt über die Länge (Dimension 0).
+        seq_embedding = seq_tensor[1 : seq_len + 1].mean(0)
         
         embeddings.append(seq_embedding.cpu().numpy())
         
     return np.array(embeddings)
-
-def fetch_uniprot_sequence(gene, organism):
-    # API URL
-    url = "https://rest.uniprot.org/uniprotkb/search"
-    
-    # Suchanfrage: Gen-Name + Organismus + Reviewed (nur kuratierte Swiss-Prot Einträge)
-    query = f"gene:{gene} AND organism_name:{organism} AND reviewed:true"
-    
-    params = {
-        "query": query,
-        "format": "json",
-        "size": 1  # Wir nehmen den besten/ersten Treffer
-    }
-    
-    try:
-        response = requests.get(url, params=params)
-        response.raise_for_status()
-        data = response.json()
-        
-        if data['results']:
-            # Die Sequenz extrahieren
-            sequence = data['results'][0]['sequence']['value']
-            entry_id = data['results'][0]['primaryAccession']
-            print(f"✅ Found {gene} in {organism} (ID: {entry_id})")
-            return sequence
-        else:
-            print(f"⚠️ No result for {gene} in {organism}")
-            return None
-            
-    except Exception as e:
-        print(f"❌ Error fetching {gene}_{organism}: {e}")
-        return None
