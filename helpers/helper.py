@@ -1,11 +1,23 @@
 import torch
 import numpy as np
+import pandas as pd
 import copy
 import requests
+import os
+import ssl
+import urllib.request
 from typing import Dict, Tuple, List
 
 UNIPROT_FASTA_URL = "https://www.uniprot.org/uniprot/{uid}.fasta"
 UNIPROT_SEARCH_URL = "https://www.uniprot.org/uniprot/"
+
+SCOP_URL = "https://scop.berkeley.edu/downloads/scopeseq-2.07/astral-scopedom-seqres-gd-sel-gs-bib-40-2.07.fa"
+FILENAME = "astral-scopedom-seqres-gd-sel-gs-bib-40-2.07.fa"
+
+# Exclusion Lists for Experiment 3 (from the paper)
+ROSSMANN_EXCLUSIONS = ['c.2', 'c.3', 'c.4', 'c.5', 'c.27', 'c.28', 'c.30', 'c.31']
+BETA_PROP_EXCLUSIONS = ['b.66', 'b.67', 'b.68', 'b.69', 'b.70']
+
 
 
 def randomize_model(model):
@@ -118,3 +130,81 @@ def get_protein_embedding(token_representations, batch_strs):
         embeddings.append(seq_embedding.cpu().numpy())
         
     return np.array(embeddings)
+
+def download_no_requests():
+    """Downloads using standard urllib with SSL verification disabled."""
+    if os.path.exists(FILENAME):
+        print("File already exists. Skipping download.")
+        return
+
+    print(f"Downloading {FILENAME} using urllib (SSL ignored)...")
+    
+    # Create an unverified SSL context to bypass the error
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    
+    try:
+        with urllib.request.urlopen(SCOP_URL, context=ctx) as response, open(FILENAME, 'wb') as out_file:
+            out_file.write(response.read())
+        print("Download complete.")
+    except Exception as e:
+        print(f"Download failed: {e}")
+        print("Please try the Manual Download option below.")
+
+def parse_and_filter_scop():
+    """Parses FASTA headers and filters out excluded folds."""
+    data = []
+    
+    if not os.path.exists(FILENAME):
+        print("Error: File not found.")
+        return pd.DataFrame()
+
+    print("Parsing and filtering sequences...")
+    with open(FILENAME, 'r') as f:
+        current_header = None
+        current_seq = []
+        
+        for line in f:
+            line = line.strip()
+            if line.startswith(">"):
+                if current_header:
+                    process_entry(current_header, "".join(current_seq), data)
+                current_header = line
+                current_seq = []
+            else:
+                current_seq.append(line)
+        
+        if current_header:
+            process_entry(current_header, "".join(current_seq), data)
+            
+    return pd.DataFrame(data)
+
+def process_entry(header, sequence, data_list):
+    # Header format example: >d1dlwa_ a.4.5.1 (A:)
+    parts = header.split()
+    if len(parts) < 2: return
+    
+    domain_id = parts[0][1:]
+    scop_code = parts[1]
+    hierarchy = scop_code.split('.')
+    
+    if len(hierarchy) < 4: return
+    
+    fold = f"{hierarchy[0]}.{hierarchy[1]}"
+    superfamily = f"{hierarchy[0]}.{hierarchy[1]}.{hierarchy[2]}"
+    family = scop_code
+    
+    # FILTERING LOGIC (Phase 1 Rules)
+    is_rossmann = any(fold.startswith(ex) for ex in ROSSMANN_EXCLUSIONS)
+    is_beta_prop = any(fold.startswith(ex) for ex in BETA_PROP_EXCLUSIONS)
+    
+    if not is_rossmann and not is_beta_prop:
+        data_list.append({
+            "domain_id": domain_id,
+            "sequence": sequence,
+            "class": hierarchy[0],
+            "fold": fold,
+            "superfamily": superfamily,
+            "family": family
+        })
