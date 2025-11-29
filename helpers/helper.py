@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import copy
 import requests
+import gzip
 import os
 import ssl
 import urllib.request
@@ -208,3 +209,29 @@ def process_entry(header, sequence, data_list):
             "superfamily": superfamily,
             "family": family
         })
+
+def get_pfam_seed_by_id(pfam_accession):
+    """
+    Streams the Pfam-A seed database from EBI FTP and extracts a specific family.
+    Bypasses broken API endpoints.
+    """
+    # Official EBI FTP URL for the current release of Pfam Seed Alignments
+    url = "http://ftp.ebi.ac.uk/pub/databases/Pfam/current_release/Pfam-A.seed.gz"
+    
+    print(f"Streaming Pfam database to find {pfam_accession}...")
+    print("This may take 1-2 minutes as it searches the compressed stream.")
+
+    with urllib.request.urlopen(url) as response:
+        # Decompress the stream on the fly
+        with gzip.open(response, 'rt') as f:
+            entry_buffer = []
+            for line in f:
+                entry_buffer.append(line)
+                # End of a record in Stockholm format
+                if line.startswith("//"):
+                    block = "".join(entry_buffer)
+                    # Check if this block matches our target Accession
+                    if f"AC   {pfam_accession}" in block:
+                        return block
+                    entry_buffer = [] # Reset buffer for next entry
+    return None
