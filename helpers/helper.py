@@ -2,7 +2,6 @@ import torch
 import numpy as np
 import pandas as pd
 import copy
-import requests
 import gzip
 import os
 import ssl
@@ -10,6 +9,9 @@ import urllib.request
 from typing import Dict, Tuple, List
 from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
+from sklearn.metrics.pairwise import cosine_similarity
+
+import random
 
 UNIPROT_FASTA_URL = "https://www.uniprot.org/uniprot/{uid}.fasta"
 UNIPROT_SEARCH_URL = "https://www.uniprot.org/uniprot/"
@@ -287,3 +289,144 @@ def plot_tsne_exp1(amino_acids_df, representations):
     ax.set_ylabel("TSNE-2")
     ax.legend()
     plt.show()
+
+
+def sample_aligned_pairs(
+    mapping_list: List[Dict], alignment_length: int, num_seqs: int, num_samples=50000
+) -> List[Tuple[int, int, int, int]]:
+    """
+    Samples aligned residue pairs from a list of mappings.
+
+    Args:
+        mapping_list (List[Dict]): List of mappings with 'query_pos' and 'template_pos'.
+        msa_length (int): Length of the MSA.
+    """
+    aligned_pairs = []
+    # --- Sampling Aligned Pairs ---
+    # Pick a random column in the MSA, find two sequences that both have a residue there.
+    attempts = 0
+    while len(aligned_pairs) < num_samples and attempts < num_samples * 5:
+        attempts += 1
+        alligned_col = random.randint(0, alignment_length - 1)
+
+        # Pick two random sequences
+        seq_a_idx = random.randint(0, num_seqs - 1)
+        seq_b_idx = random.randint(0, num_seqs - 1)
+
+        if seq_a_idx == seq_b_idx:
+            continue
+
+        # Check if both sequences have a residue at this MSA column (no gap)
+        map_a = mapping_list[seq_a_idx]
+        map_b = mapping_list[seq_b_idx]
+
+        if alligned_col in map_a and alligned_col in map_b:
+            # Get the embeddings for these specific residues
+            # Note: token_reps includes <cls> at 0, so we add 1 to the mapped index
+            aligned_pairs.append((seq_a_idx, seq_b_idx, alligned_col, alligned_col))
+    return aligned_pairs
+
+
+def get_cosine_similarity(
+    seq_pairs: List[Tuple[int, int, int, int]], token_reps, mapping_list
+):
+    """
+    Computes cosine similarity for given sequence pairs using vectorized operations.
+
+    Args:
+        seq_pairs (List[Tuple[int, int, int]]): List of tuples (seq_a_idx, seq_b_idx, aligned_col).
+
+    """
+    # Extract embeddings for all pairs at once
+    emb_a_list = []
+    emb_b_list = []
+
+    print(f"tokens_reps length: {len(token_reps)}")
+    print(f"tokens_reps length: {len(token_reps[0].shape)}")
+
+    for seq_a_idx, seq_b_idx, col_a_idx, col_b_idx in seq_pairs:
+        map_a = mapping_list[seq_a_idx]
+        map_b = mapping_list[seq_b_idx]
+
+        print("creating embeddings for cosine similarity...")
+        print(f"embs creation: {token_reps[seq_a_idx].shape}")
+        # +1 because of <cls> token at position 0
+        emb_a_list.append(token_reps[seq_a_idx][map_a[col_a_idx] + 1].cpu().numpy())
+        emb_b_list.append(token_reps[seq_b_idx][map_b[col_b_idx] + 1].cpu().numpy())
+
+    # Stack into matrices: shape [num_pairs, embedding_dim]
+    print(f"emb_a_list: {emb_a_list[:3]}")
+    emb_a = np.array(emb_a_list)
+    emb_b = np.array(emb_b_list)
+    print(f"emb_a shape: {emb_a.shape}, emb_b shape: {emb_b.shape}")
+    # Compute all similarities at once
+    sims = np.sum(emb_a * emb_b, axis=1) / (
+        np.linalg.norm(emb_a, axis=1) * np.linalg.norm(emb_b, axis=1)
+    )
+
+    # sims = cosine_similarity(emb_a, emb_b).diagonal()
+
+    return sims.tolist()
+
+
+def sample_unaligned_pairs(
+    aligned_pairs: List[Tuple[int, int, int, int]],
+    mapping_list: List[Dict],
+    num_seqs: int,
+) -> List[Tuple[int, int, int, int]]:
+    """
+    Samples unaligned residue pairs from a list of mappings and aligned pairs for the background distribution.
+    Take into account possible bias because of positional encodings.
+
+    Args:
+        mapping_list (List[Dict]): List of mappings with 'query_pos' and 'template_pos'.
+        msa_length (int): Length of the MSA.
+    """
+    unaligned_indices = []
+    for seq_a_idx, seq_b_idx, aligned_col, _ in aligned_pairs:
+        # 1. Calculate the absolute value of the difference of each residue's within-sequence positions
+        map_a = mapping_list[seq_a_idx]
+        map_b = mapping_list[seq_b_idx]
+        pos_diff = abs(map_a[aligned_col] - map_b[aligned_col])
+
+        while True:
+            # 2. Select a pair of sequences at random
+            seq_c_idx = random.randint(0, num_seqs - 1)
+            seq_d_idx = random.randint(0, num_seqs - 1)
+
+            if seq_c_idx == seq_d_idx:
+                continue
+
+            # 3. For that pair of sequences, select a pair of residues at random
+            # whose absolute value of positional difference equals the one calculated above
+            map_c = mapping_list[seq_c_idx]
+            map_d = mapping_list[seq_d_idx]
+            reversed_map_d = {v: k for k, v in map_d.items()}
+            attempts_unaligned = 0
+            max_attempts = 100
+
+            while attempts_unaligned < max_attempts:
+                attempts_unaligned += 1
+
+                # Get random positions from both sequences
+                # is this correct? TODO
+                pos_c = random.choice(list(map_c.keys()))
+                real_pos_c = map_c[pos_c]
+                sign = random.choice([-1, 1])
+                real_pos_d = real_pos_c + sign * pos_diff
+                if real_pos_d in reversed_map_d.keys():
+                    break
+
+                real_pos_d = real_pos_c - sign * pos_diff
+                if real_pos_d in reversed_map_d.keys():
+                    break
+                else:
+                    continue
+            pos_d = reversed_map_d[real_pos_d]
+
+            # 4. Verify that the residues are unaligned (different MSA columns)
+            if pos_c != pos_d:
+                unaligned_indices.append((seq_c_idx, seq_d_idx, pos_c, pos_d))
+                break
+
+    return unaligned_indices
