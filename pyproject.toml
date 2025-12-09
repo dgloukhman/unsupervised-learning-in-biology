@@ -7,7 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "bio>=1.8.1",
     "bpython>=0.26",
-    "fair-esm",
+    "fair-esm[fold]",
     "ipykernel>=7.1.0",
     "matplotlib>=3.10.7",
     "pandas>=2.3.3",
