@@ -25,13 +25,25 @@ BETA_PROP_EXCLUSIONS = ["b.66", "b.67", "b.68", "b.69", "b.70"]
 
 
 def randomize_model(model):
-    uninit_model = copy.deepcopy(model)
-    for name, param in uninit_model.named_parameters():
-        if "weight" in name and param.dim() > 1:
+    # 1. Move original to CPU temporarily to avoid GPU-copy errors
+    device = next(model.parameters()).device
+    model.cpu()
+    
+    # 2. Create the copy safely on CPU
+    untrained_model = copy.deepcopy(model)
+    
+    # 3. Move original back to its device immediately
+    model.to(device)
+    
+    # 4. Randomize weights on the copy
+    for name, param in untrained_model.named_parameters():
+        if 'weight' in name and param.dim() > 1:
             torch.nn.init.xavier_uniform_(param)
-        elif "bias" in name:
+        elif 'bias' in name:
             torch.nn.init.constant_(param, 0)
-    return uninit_model
+            
+    # 5. Return untrained model (caller handles moving it to GPU)
+    return untrained_model
 
 
 def get_hidden_representations(model, alphabet, labels, sequences, batch_size=1):
@@ -197,6 +209,8 @@ def process_entry(header, sequence, data_list):
     parts = header.split()
     if len(parts) < 2:
         return
+    
+    #print(parts)
 
     domain_id = parts[0][1:]
     scop_code = parts[1]
