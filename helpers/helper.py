@@ -9,7 +9,7 @@ import urllib.request
 from typing import Dict, Tuple, List
 from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
-from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.metrics import roc_auc_score
 
 import random
 
@@ -28,20 +28,20 @@ def randomize_model(model):
     # 1. Move original to CPU temporarily to avoid GPU-copy errors
     device = next(model.parameters()).device
     model.cpu()
-    
+
     # 2. Create the copy safely on CPU
     untrained_model = copy.deepcopy(model)
-    
+
     # 3. Move original back to its device immediately
     model.to(device)
-    
+
     # 4. Randomize weights on the copy
     for name, param in untrained_model.named_parameters():
-        if 'weight' in name and param.dim() > 1:
+        if "weight" in name and param.dim() > 1:
             torch.nn.init.xavier_uniform_(param)
-        elif 'bias' in name:
+        elif "bias" in name:
             torch.nn.init.constant_(param, 0)
-            
+
     # 5. Return untrained model (caller handles moving it to GPU)
     return untrained_model
 
@@ -209,8 +209,8 @@ def process_entry(header, sequence, data_list):
     parts = header.split()
     if len(parts) < 2:
         return
-    
-    #print(parts)
+
+    # print(parts)
 
     domain_id = parts[0][1:]
     scop_code = parts[1]
@@ -306,15 +306,30 @@ def plot_tsne_exp1(amino_acids_df, representations):
 
 
 def sample_aligned_pairs(
-    mapping_list: List[Dict], num_seqs: int, num_samples=50000
+    mapping_list: List[Dict],
+    num_samples=50000,
+    msa: List[str] = None,
+    mode: str = "all",
 ) -> List[Tuple[int, int, int, int]]:
     """
     Samples aligned residue pairs from a list of mappings.
 
     Args:
         mapping_list (List[Dict]): List of mappings with 'query_pos' and 'template_pos'.
-        msa_length (int): Length of the MSA.
+        num_seqs (int): Number of sequences.
+        num_samples (int): The number of pairs to sample.
+        msa (List[str], optional): List of sequence strings. Required for 'identity' or 'distinct' modes.
+        mode (str, optional): 'all', 'identity', or 'distinct'. Defaults to 'all'.
     """
+    num_seqs = len(msa)
+    if mode not in ["all", "identity", "distinct"]:
+        raise ValueError("mode must be one of 'all', 'identity', or 'distinct'")
+
+    if mode != "all":
+        if msa is None:
+            raise ValueError("msa must be provided for 'identity' or 'distinct' mode.")
+        if len(msa) != num_seqs:
+            raise ValueError("length of msa must be equal to num_seqs")
 
     aligned_pairs = []
     # --- Sampling Aligned Pairs ---
@@ -334,10 +349,26 @@ def sample_aligned_pairs(
         map_a = mapping_list[seq_a_idx]
         map_b = mapping_list[seq_b_idx]
 
+        if not map_a:
+            continue
+
         alligned_col = random.choice(list(map_a.keys()))
         alligned_col = int(alligned_col)
 
         if alligned_col in map_a and alligned_col in map_b:
+            if mode != "all":
+                pos_a = map_a[alligned_col]
+                pos_b = map_b[alligned_col]
+
+                aa_a = msa[seq_a_idx][pos_a]
+                aa_b = msa[seq_b_idx][pos_b]
+
+                if mode == "identity":
+                    if aa_a != aa_b:
+                        continue
+                elif mode == "distinct":
+                    if aa_a == aa_b:
+                        continue
             # Get the embeddings for these specific residues
             # Note: token_reps includes <cls> at 0, so we add 1 to the mapped index
             aligned_pairs.append((seq_a_idx, seq_b_idx, alligned_col, alligned_col))
@@ -434,3 +465,100 @@ def get_cosine_similarity(
     # sims = cosine_similarity(emb_a, emb_b).diagonal()
 
     return sims.tolist()
+
+
+def clean_and_map_msa(msa):
+    clean_seqs = []
+    msa_mapping = []  # List of dictionaries: {msa_column_index: sequence_residue_index}
+
+    print(f"Processing {len(msa)} sequences...")
+
+    for record in msa:
+        original_seq = str(record.seq).upper()
+        clean_seq = ""
+        mapping = {}
+
+        seq_idx = 0
+        for msa_idx, char in enumerate(original_seq):
+            # Pfam uses '.' and '-' for gaps. We only want amino acids.
+            if char not in [".", "-"]:
+                clean_seq += char
+                # Record that this MSA column corresponds to this index in the clean sequence
+                mapping[msa_idx] = seq_idx
+                seq_idx += 1
+
+        clean_seqs.append(clean_seq)
+        msa_mapping.append(mapping)
+    return clean_seqs, msa_mapping
+
+
+def forward_pass(clean_seqs, model, alphabet):
+    # print("Running forward pass on TRAINED model...")
+    # Note: We use the helper, but we pass the labels=None explicitly if your helper expects it
+    with torch.no_grad():
+        token_reps_trained, batch_strs_trained = get_hidden_representations(
+            model, alphabet, np.zeros_like(clean_seqs), clean_seqs
+        )
+
+    # B. Untrained Model (Random Baseline)
+    # print("Running forward pass on UNTRAINED model...")
+    # Create a randomized version of the model to test the "Emergence" hypothesis
+    untrained_model = randomize_model(model)
+    if torch.cuda.is_available():
+        untrained_model = untrained_model.cuda()
+
+    with torch.no_grad():
+        token_reps_untrained, batch_strs_untrained = get_hidden_representations(
+            untrained_model, alphabet, np.zeros_like(clean_seqs), clean_seqs
+        )
+    return token_reps_trained, token_reps_untrained
+    # --- Evaluation (AUC) ---
+
+
+# Quantify the separation between the distributions
+def get_auc(
+    train_aligned_sim,
+    train_unaligned_sim,
+    untrain_aligned_sim,
+    untrain_unaligned_sim,
+    print_stats=False,
+):
+    def calculate_auc(aligned, unaligned):
+        y_true = [1] * len(aligned) + [0] * len(unaligned)
+        y_scores = np.concatenate([aligned, unaligned])
+        return roc_auc_score(y_true, y_scores)
+
+    auc_trained = calculate_auc(train_aligned_sim, train_unaligned_sim)
+    auc_untrained = calculate_auc(untrain_aligned_sim, untrain_unaligned_sim)
+
+    if print_stats:
+        print(f"AUC Score (Discrimination between Aligned/Unaligned):")
+        print(f"Trained Model:   {auc_trained:.4f}")
+        print(f"Untrained Model: {auc_untrained:.4f}")
+    return auc_trained, auc_untrained
+
+
+# Plot Helper
+def plot_dist(ax, aligned, unaligned, title):
+    # Plot histograms with density
+    ax.hist(
+        aligned,
+        bins=50,
+        density=True,
+        alpha=0.6,
+        color="darkblue",
+        label="Aligned pairs",
+    )
+    ax.hist(
+        unaligned,
+        bins=50,
+        density=True,
+        alpha=0.6,
+        color="lightblue",
+        label="Unaligned pairs",
+    )
+    ax.set_title(title)
+    ax.set_xlabel("Cosine Similarity")
+    ax.set_ylabel("Density")
+    ax.legend()
+    ax.set_xlim(0, 1)
