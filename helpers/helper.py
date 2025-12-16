@@ -322,6 +322,7 @@ def sample_aligned_pairs(
         mode (str, optional): 'all', 'identity', or 'distinct'. Defaults to 'all'.
     """
     num_seqs = len(msa)
+    print(mode)
     if mode not in ["all", "identity", "distinct"]:
         raise ValueError("mode must be one of 'all', 'identity', or 'distinct'")
 
@@ -349,19 +350,13 @@ def sample_aligned_pairs(
         map_a = mapping_list[seq_a_idx]
         map_b = mapping_list[seq_b_idx]
 
-        if not map_a:
-            continue
-
         alligned_col = random.choice(list(map_a.keys()))
         alligned_col = int(alligned_col)
 
-        if alligned_col in map_a and alligned_col in map_b:
+        if alligned_col in map_a.keys() and alligned_col in map_b.keys():
             if mode != "all":
-                pos_a = map_a[alligned_col]
-                pos_b = map_b[alligned_col]
-
-                aa_a = msa[seq_a_idx][pos_a]
-                aa_b = msa[seq_b_idx][pos_b]
+                aa_a = msa[seq_a_idx][alligned_col]
+                aa_b = msa[seq_b_idx][alligned_col]
 
                 if mode == "identity":
                     if aa_a != aa_b:
@@ -431,7 +426,7 @@ def sample_unaligned_pairs(
 
 
 def get_cosine_similarity(
-    seq_pairs: List[Tuple[int, int, int, int]], token_reps, mapping_list
+    seq_pairs: List[Tuple[int, int, int, int]], token_reps, mapping_list, msa=None
 ):
     """
     Computes cosine similarity for given sequence pairs using vectorized operations.
@@ -447,6 +442,10 @@ def get_cosine_similarity(
     for seq_a_idx, seq_b_idx, col_a_idx, col_b_idx in seq_pairs:
         map_a = mapping_list[seq_a_idx]
         map_b = mapping_list[seq_b_idx]
+
+        # check alignment identity
+        # if msa is not None:
+        #     print(msa[seq_a_idx][col_a_idx] == msa[seq_b_idx][col_b_idx])
 
         # +1 because of <cls> token at position 0
         emb_a_list.append(token_reps[seq_a_idx][map_a[col_a_idx] + 1].cpu().numpy())
